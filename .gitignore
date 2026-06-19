@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Audio + generated test artifacts
+*.wav
+*.flac
+*.ogg
+*.sfk
+*.tmp
+*.tmp.tmp
+
+# Screenshots / images
+*.png
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
