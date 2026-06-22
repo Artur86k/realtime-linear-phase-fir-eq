@@ -66,6 +66,20 @@ class AudioEngine:
         self.clipped = False
         self.input_gain = 1.0      # linear; set from the dB slider
 
+        # Optional final-stage limiter (Python port of the JS worklet). When
+        # set + enabled, it runs on the filtered block and we DON'T hard-clip
+        # (the limiter is the real peak protection; a safety clamp remains).
+        self.limiter = None
+        self.limiter_enabled = False
+
+        # Analysis ring: the audio thread pushes the post-gain INPUT block here
+        # (single producer); the sound-improver thread reads recent windows
+        # (single consumer). Lock-free; a torn window only blips one FFT.
+        self._ring_len = 1 << 15            # 32768 frames (~0.68 s @ 48k)
+        self._ring = np.zeros((self._ring_len, 2), dtype=np.float64)
+        self._ring_write = 0                # monotonic write count
+        self._ring_filled = 0
+
         # Output recording (optional). The callback appends one block ref per
         # callback when armed — cheap enough; written to disk on stop.
         self.recording = False
@@ -181,6 +195,10 @@ class AudioEngine:
         in_block = self._read_loop(frames)            # (frames, 2) float64
         in_block *= self.input_gain
 
+        # Feed the analysis ring with the post-gain INPUT (feedforward detector
+        # for the sound-improver). Cheap index-assign, no allocation.
+        self._ring_push(in_block)
+
         N = self.N
         # x_ext = [history ; in_block]  -> length N-1+frames, per channel.
         x_ext = np.empty((N - 1 + frames, 2), dtype=np.float64)
@@ -219,7 +237,14 @@ class AudioEngine:
         # Update the delay line with the most recent N-1 input samples.
         self.history = x_ext[-(N - 1):].copy()
 
-        # Clip detect + write out.
+        # Optional final-stage limiter (peak control + makeup). Runs on the
+        # filtered block; adds its own small lookahead latency.
+        if self.limiter is not None and self.limiter_enabled:
+            y = self.limiter.process(y)
+
+        # Clip detect (pre-clamp peak) + write out. With the limiter engaged the
+        # clamp below should never bite; without it, it's the only overload
+        # guard. We keep the indicator either way.
         peak = float(np.max(np.abs(y))) if y.size else 0.0
         self.last_peak = peak
         self.clipped = peak >= 1.0
@@ -246,6 +271,38 @@ class AudioEngine:
                 pos = 0
         with self._lock:
             self.read_pos = pos
+        return out
+
+    # ---- analysis ring (for the sound-improver) --------------------------
+    def _ring_push(self, block):
+        """Append a (frames, 2) block to the circular analysis buffer."""
+        n = block.shape[0]
+        L = self._ring_len
+        w = self._ring_write % L
+        end = w + n
+        if end <= L:
+            self._ring[w:end] = block
+        else:                               # wrap
+            k = L - w
+            self._ring[w:] = block[:k]
+            self._ring[:end - L] = block[k:]
+        self._ring_write += n
+        self._ring_filled = min(self._ring_filled + n, L)
+
+    def get_analysis_window(self, win):
+        """Return the most recent `win` stereo frames (copy), or None if not
+        enough has been buffered yet. Lock-free single-consumer read."""
+        if win > self._ring_len or self._ring_filled < win:
+            return None
+        w = self._ring_write % self._ring_len
+        start = (w - win) % self._ring_len
+        out = np.empty((win, 2), dtype=np.float64)
+        if start + win <= self._ring_len:
+            out[:] = self._ring[start:start + win]
+        else:
+            k = self._ring_len - start
+            out[:k] = self._ring[start:]
+            out[k:] = self._ring[:win - k]
         return out
 
     @staticmethod

@@ -31,10 +31,14 @@ if __package__ in (None, ""):
     import filter_design as fd
     from audio_engine import AudioEngine, CoeffHolder
     from curve_editor import CurveEditor
+    from limiter import Limiter
+    from sound_improver import AnalysisEngine
 else:
     from . import filter_design as fd
     from .audio_engine import AudioEngine, CoeffHolder
     from .curve_editor import CurveEditor
+    from .limiter import Limiter
+    from .sound_improver import AnalysisEngine
 
 # ---- Constants -----------------------------------------------------------
 FS_FALLBACK = 48000
@@ -60,6 +64,12 @@ class App:
         self.holder = CoeffHolder(b0)
         self.engine = AudioEngine(self.holder, blocksize=BLOCKSIZE,
                                   fs_fallback=FS_FALLBACK)
+
+        # Sound-improver (adaptive multiband) + limiter are built lazily on
+        # first toggle, once open_stream() has finalised the device rate.
+        self.improver = None
+        self.limiter = None
+        self._last_auto_version = self.holder.version
 
         # ---- Figure layout ----
         self.fig = plt.figure(figsize=(10, 8))
@@ -154,6 +164,9 @@ class App:
         self.btn_stop = mk_button(0.34, "Stop", lambda e: self.engine.stop())
         self.btn_load = mk_button(0.46, "Load", lambda e: self._on_load_click())
         self.btn_rec = mk_button(0.58, "Record", self._on_record)
+        # Adaptive "sound improver" + final limiter toggles.
+        self.btn_improve = mk_button(0.70, "Improve", self._on_improve)
+        self.btn_limit = mk_button(0.82, "Limiter", self._on_limiter)
 
         # Status timer: clip indicator + progress/time readout.
         self._last_clip = False
@@ -207,6 +220,11 @@ class App:
         self._dirty = True
 
     def _tick(self):
+        # When the sound-improver drives the curve, just mirror its output
+        # (taps + measured overlay) into the plots; ignore manual edits.
+        if self.improver is not None and self.improver.enabled:
+            self._auto_refresh()
+            return
         if not self._dirty:
             return
         self._dirty = False
@@ -230,10 +248,57 @@ class App:
             self._blit_region(self.editor.animated_artists, self.ax_eq)
             self._blit_region([self.taps_line], self.ax_taps)
 
+    def _auto_refresh(self):
+        """GUI-thread mirror of the improver's latest curve. The improver
+        thread only writes the holder; all matplotlib calls stay here."""
+        v = self.holder.version
+        if v == self._last_auto_version:
+            return
+        self._last_auto_version = v
+        b = self.holder.b_target
+        self.taps_line.set_ydata(b)
+        self._update_fir_overlay(b)
+        peak = float(np.max(np.abs(b))) or 1e-6
+        lo, hi = self.ax_taps.get_ylim()
+        if peak > hi or peak < hi * 0.4:
+            self.ax_taps.set_ylim(-peak * 1.15, peak * 1.15)
+            self.fig.canvas.draw_idle()
+        else:
+            self._blit_region(self.editor.animated_artists, self.ax_eq)
+            self._blit_region([self.taps_line], self.ax_taps)
+
     def _update_fir_overlay(self, b):
         freqs = self.editor.freq_grid
         mag_db = fd.fir_magnitude_db(b, self.fs, freqs)
         self.editor.set_fir_overlay(freqs, mag_db)
+
+    # ---- sound-improver / limiter toggles --------------------------------
+    def _on_improve(self, event):
+        # Build lazily once open_stream() has finalised the device rate.
+        self.engine.open_stream()
+        if self.improver is None:
+            self.improver = AnalysisEngine(self.engine, self.holder, self.N,
+                                           M_DESIGN, KAISER_BETA)
+            self.improver.start()
+        on = not self.improver.enabled
+        self.improver.set_enabled(on)
+        self.editor.enabled = not on      # suppress manual edits while auto
+        self.btn_improve.label.set_text("Improve*" if on else "Improve")
+        self.btn_improve.ax.set_facecolor("#90EE90" if on else "0.85")
+        self.fig.canvas.draw_idle()
+
+    def _on_limiter(self, event):
+        self.engine.open_stream()
+        if self.limiter is None:
+            # First build compiles the JIT kernel (warmup) — done here on the
+            # GUI thread so the audio callback never pays that cost.
+            self.limiter = Limiter(self.engine.fs)
+            self.engine.limiter = self.limiter
+        on = not self.engine.limiter_enabled
+        self.engine.limiter_enabled = on
+        self.btn_limit.label.set_text("Limiter*" if on else "Limiter")
+        self.btn_limit.ax.set_facecolor("#90EE90" if on else "0.85")
+        self.fig.canvas.draw_idle()
 
     # ---- widget callbacks ------------------------------------------------
     def _on_gain(self, val):
@@ -362,6 +427,8 @@ class App:
         try:
             plt.show()
         finally:
+            if self.improver is not None:
+                self.improver.stop()
             self.engine.close()
 
 

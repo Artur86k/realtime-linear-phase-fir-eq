@@ -31,6 +31,9 @@ class CurveEditor:
         self.on_change = on_change
         self.curve_fn = curve_fn
 
+        # When False, mouse editing is ignored (e.g. while the sound-improver
+        # is driving the curve automatically).
+        self.enabled = True
         self._drag_idx = None
 
         self.curve_line, = ax.semilogx([], [], "-", color="#1f77b4", lw=2,
@@ -81,6 +84,8 @@ class CurveEditor:
 
     # ---- event handlers --------------------------------------------------
     def _on_press(self, event):
+        if not self.enabled:
+            return
         if event.inaxes != self.ax or event.xdata is None:
             return
         idx = self._nearest_point(event)
@@ -108,6 +113,8 @@ class CurveEditor:
                 self._changed()
 
     def _on_motion(self, event):
+        if not self.enabled:
+            return
         if self._drag_idx is None or event.inaxes != self.ax or event.xdata is None:
             return
         f, g = self._clamp(event.xdata, event.ydata)

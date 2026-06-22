@@ -3,3 +3,6 @@ scipy
 sounddevice
 soundfile
 matplotlib
+# Optional: JIT-accelerates the limiter's per-sample loop. Not required
+# (pure-Python fallback uses ~5% of the audio block budget at 1024/48k).
+numba ; platform_python_implementation == "CPython"

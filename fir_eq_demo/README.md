@@ -35,6 +35,12 @@ A single window opens:
 - **Input (dB) slider** — ±20 dB pre-filter gain. The **clip indicator** turns
   red if any output sample reaches |x| ≥ 1.0.
 - **Play / Pause / Stop / Load** buttons.
+- **Improve** button — toggles the **adaptive multiband sound-improver**: it
+  analyses the playing audio and continuously rewrites the EQ curve toward a
+  broadcast "radio voice" target (see below). While active, manual editing is
+  suspended and you watch the measured (orange) curve and the taps morph live.
+- **Limiter** button — toggles the final-stage **lookahead limiter** (a Python
+  port of the JS worklet limiter) for peak control + makeup.
 - **Record** button — captures exactly what's sent to the output (post-filter,
   post-gain) while you drag the curve, and writes it to a 32-bit float WAV when
   you press *Stop Rec*. Great for capturing a live edit session to analyze in
@@ -99,6 +105,61 @@ Result: idle/playback GUI load dropped ~**80% → <10%** of a core (≈0% paused
 and dragging went from ~12 fps (full redraws) to a steady **60 fps** with
 headroom to spare.
 
+## Adaptive sound improver (multiband) + limiter
+
+The **Improve** button turns the manual EQ into an *adaptive multiband
+leveler/compressor* that pushes a voice toward a broadcast ("radio voice")
+sound — automatically, while it plays.
+
+**Key idea — the curve *is* the per-band gain.** In a linear-phase FIR the
+magnitude response is literally the gain at each frequency, so a "band" is just
+a region of that curve and a multiband compressor is nothing more than per-band
+gain that reacts to per-band level over time. No separate crossover filterbank
+is needed: the existing `design_fir` + lock-free `CoeffHolder` + crossfade *are*
+the de-zippering for a continuously moving compressor. Because every redesigned
+curve shares the same `N` and linear phase (identical group delay), consecutive
+swaps stay phase-coherent — no combing during the motion.
+
+`sound_improver.py` runs an **analysis thread** (off the audio thread) that, at
+~80 Hz:
+
+1. pulls the most recent ~4096 input frames from a lock-free ring the audio
+   callback fills (feed-forward detector);
+2. computes a windowed power spectrum and per-band level (6 voice bands:
+   ~20–120, 120–350, 350–900, 0.9–2.5 k, 2.5–6 k, 6–20 k Hz);
+3. per band, a soft-knee **gain computer** + **attack/release** smoothing
+   (time-aware one-pole) produces a gain-reduction value;
+4. adds the fixed **"radio" tone target** (low-rumble cut, low-mid warmth,
+   2–5 kHz presence lift, gentle de-ess) and emits control points →
+   `design_fir` → `holder.update`.
+
+The min effective attack is one audio block (~21 ms at 1024/48 k) — ideal for
+**density / leveling**, not fast peak control. The improver deliberately leaves
+headroom (it shapes *balance*, not loudness); fast peak control + makeup is the
+limiter's job.
+
+### Limiter (`limiter.py`)
+
+A faithful Python port of the sample-accurate lookahead limiter at
+<https://github.com/Artur86k/limiter> (`limiter-worklet.js`):
+ring-buffer lookahead delay, instant-attack / adaptive-hold / exponential-decay
+peak envelope follower, soft-knee reduction toward `saturation_db`, and makeup
+`output_gain_db`. The analyser also feeds it spectral hints (centroid,
+low-band energy, rms) that shape its adaptive recovery and hold — exactly as the
+original took them from its main-thread analyser.
+
+The envelope has a per-sample feedback dependency (instant attack, data-driven
+hold), so it's a tight scalar loop. With **Numba** present it's JIT-compiled
+(and warmed up at construction so the first audio block never stalls);
+otherwise the identical code runs in CPython — measured at **~1.0 ms/block**
+(4.7 % of the 21.3 ms deadline at 1024/48 k), so Numba is optional. It adds its
+own lookahead latency (default 0.5 ms, negligible next to the FIR's ~21 ms).
+
+> **Note on the original limiter's scope.** That repo is a *Chrome extension*
+> (Web Audio AudioWorklet) and can only limit audio in a browser tab — it can't
+> touch this app's live `sounddevice` output. This port brings the same
+> algorithm into the realtime Python path so the live demo is peak-safe too.
+
 ## DSP: linear-phase FIR from the curve
 
 Type I FIR (odd `N`, symmetric taps). `design_fir`:
@@ -131,22 +192,31 @@ Type I FIR (odd `N`, symmetric taps). `design_fir`:
 
 | File               | Responsibility                                            |
 |--------------------|-----------------------------------------------------------|
-| `main.py`          | GUI, wiring, throttled redesign, transport, slider, taps  |
-| `filter_design.py` | `design_fir`, curve interpolation, measured magnitude     |
-| `audio_engine.py`  | sounddevice stream, callback, delay-line conv, crossfade  |
-| `curve_editor.py`  | matplotlib point add/move/delete on the top axis          |
-| `test_dsp.py`      | headless tests: symmetry, tracking, **no-click** swap     |
+| `main.py`            | GUI, wiring, throttled redesign, transport, slider, taps |
+| `filter_design.py`   | `design_fir`, curve interpolation, measured magnitude    |
+| `audio_engine.py`    | sounddevice stream, callback, delay-line conv, crossfade, analysis ring, limiter hook |
+| `curve_editor.py`    | matplotlib point add/move/delete on the top axis         |
+| `sound_improver.py`  | adaptive multiband leveler/compressor (analysis thread)  |
+| `limiter.py`         | lookahead limiter (Python port of the JS worklet)        |
+| `test_dsp.py`        | headless tests: symmetry, tracking, **no-click** swap    |
+| `test_sound_improver.py` | headless tests: limiter ceiling, gain computer, adaptive step |
 
 ## Tests
 
 ```bash
 python test_dsp.py
+python test_sound_improver.py
 ```
 
-Verifies (no GUI / no audio device needed): taps are odd & symmetric, the FIR
-tracks the target at control points, the steady-state engine output matches a
-clean reference convolution, and the coefficient swap produces **no click** at
-the block boundary.
+`test_dsp.py` verifies (no GUI / no audio device needed): taps are odd &
+symmetric, the FIR tracks the target at control points, the steady-state engine
+output matches a clean reference convolution, and the coefficient swap produces
+**no click** at the block boundary.
+
+`test_sound_improver.py` verifies: the limiter holds loud input below its
+ceiling and passes quiet input unchanged, the compressor gain computer is
+monotone, and one adaptive step yields symmetric (linear-phase) taps while
+pulling down a band that is over threshold.
 
 ## Offline smoothness render (`render_test.py`)
 
